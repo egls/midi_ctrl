@@ -1,4 +1,4 @@
-use crate::{send_cc, send_note_off, send_note_on, send_program_change, send_realtime, open_output};
+use crate::{send_cc, send_note_off, send_note_on, send_program_change, send_realtime, open_output, midi_map::MidiMap};
 use anyhow::Result;
 use eframe::{egui, NativeOptions};
 use midir::{MidiOutput, MidiOutputConnection};
@@ -135,10 +135,11 @@ struct MidiGuiApp {
     tx: Sender<MidiCommand>,
     selected_port: Option<usize>,
     channel: u8,
-    cc_values: Vec<i32>,  // Changed to i32 for direct slider compatibility
+    cc_values: Vec<i32>,
     connected: bool,
     last_sent_cc: Option<(u8, u8)>,
     last_sent_time: Option<std::time::Instant>,
+    midi_map: MidiMap,
 }
 
 impl MidiGuiApp {
@@ -148,10 +149,11 @@ impl MidiGuiApp {
             tx,
             selected_port: None,
             channel: initial_channel,
-            cc_values: vec![0i32; 128],  // Initialize as i32
+            cc_values: vec![0i32; 128],
             connected: false,
             last_sent_cc: None,
             last_sent_time: None,
+            midi_map: MidiMap::new(),
         }
     }
 }
@@ -217,7 +219,8 @@ impl eframe::App for MidiGuiApp {
                     if let Some(time) = self.last_sent_time {
                         let elapsed = time.elapsed().as_secs_f32();
                         if elapsed < 2.0 {
-                            ui.label(format!("Last: CC {} = {}", cc, val));
+                            let param_name = self.midi_map.get_name(cc);
+                            ui.label(format!("Last: {} = {}", param_name, val));
                         }
                     }
                 }
@@ -225,44 +228,68 @@ impl eframe::App for MidiGuiApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Controllers (CC 0..127)");
+            ui.heading("Digitakt Parameters");
             ui.label("Move sliders to send CC values to your Digitakt");
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                // Show sliders in rows of 4
-                let cols = 4;
-                for row in 0..((128 + cols - 1) / cols) {
-                    ui.horizontal(|ui| {
-                        for col in 0..cols {
-                            let idx = row * cols + col;
-                            if idx >= 128 {
-                                break;
-                            }
+                // Group parameters by category
+                let mut categories: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+                
+                for cc in 0..128u8 {
+                    if let Some(param) = self.midi_map.get_parameter(cc) {
+                        categories.entry(param.category.clone())
+                            .or_insert_with(Vec::new)
+                            .push(cc);
+                    }
+                }
 
-                            ui.vertical(|ui| {
-                                ui.label(format!("CC {}", idx));
-                                
-                                // Slider directly modifies self.cc_values[idx]
-                                let slider_response = ui.add(
-                                    egui::Slider::new(&mut self.cc_values[idx], 0..=127)
-                                        .show_value(true)
-                                );
+                // Sort categories for consistent display
+                let mut sorted_categories: Vec<_> = categories.into_iter().collect();
+                sorted_categories.sort_by(|a, b| a.0.cmp(&b.0));
 
-                                // Send CC when slider changes
-                                if slider_response.changed() {
-                                    let new_val = self.cc_values[idx] as u8;
-                                    let _ = self.tx.send(MidiCommand::SendCC {
-                                        channel: self.channel,
-                                        controller: idx as u8,
-                                        value: new_val,
+                for (category, mut ccs) in sorted_categories {
+                    ccs.sort();
+                    
+                    ui.group(|ui| {
+                        ui.heading(&category);
+                        
+                        // Display sliders in rows of 2 per category
+                        let cols = 2;
+                        for row in 0..((ccs.len() + cols - 1) / cols) {
+                            ui.horizontal(|ui| {
+                                for col in 0..cols {
+                                    let idx = row * cols + col;
+                                    if idx >= ccs.len() {
+                                        break;
+                                    }
+                                    
+                                    let cc = ccs[idx];
+                                    let param_name = self.midi_map.get_name(cc);
+                                    
+                                    ui.vertical(|ui| {
+                                        ui.label(&param_name);
+                                        
+                                        let slider_response = ui.add(
+                                            egui::Slider::new(&mut self.cc_values[cc as usize], 0..=127)
+                                                .show_value(true)
+                                        );
+                                        
+                                        if slider_response.changed() {
+                                            let new_val = self.cc_values[cc as usize] as u8;
+                                            let _ = self.tx.send(MidiCommand::SendCC {
+                                                channel: self.channel,
+                                                controller: cc,
+                                                value: new_val,
+                                            });
+                                            self.last_sent_cc = Some((cc, new_val));
+                                            self.last_sent_time = Some(std::time::Instant::now());
+                                        }
+                                        
+                                        ui.label(format!("Value: {}", self.cc_values[cc as usize]));
                                     });
-                                    self.last_sent_cc = Some((idx as u8, new_val));
-                                    self.last_sent_time = Some(std::time::Instant::now());
+                                    
+                                    ui.separator();
                                 }
-
-                                ui.label(format!("Value: {}", self.cc_values[idx]));
                             });
-
-                            ui.separator();
                         }
                     });
                 }

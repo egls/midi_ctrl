@@ -9,6 +9,8 @@ use std::time::Duration;
 #[cfg(feature = "egui")]
 mod gui;
 
+mod midi_map;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Simple Digitakt MIDI controller - CLI + egui UI")]
 struct Args {
