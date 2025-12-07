@@ -1739,6 +1739,7 @@ dependencies = [
  "clap",
  "eframe",
  "midir",
+ "winapi",
 ]
 
 [[package]]

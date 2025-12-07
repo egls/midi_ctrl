@@ -31,11 +31,8 @@ fn list_midi_outputs(midi_out: &MidiOutput) -> Result<Vec<String>> {
     Ok(names)
 }
 
-// NOTE: changed to create a local MidiOutput to avoid moving from a &MidiOutput.
-// This prevents the "cannot move out of `*midi_out` which is behind a shared reference" error.
-fn open_output(
-    port_index: usize,
-) -> Result<MidiOutputConnection> {
+// create a local MidiOutput to avoid ownership problems when connecting
+fn open_output(port_index: usize) -> Result<MidiOutputConnection> {
     let midi_out = MidiOutput::new("midi_ctrl")?;
     let ports = midi_out.ports();
     let port = ports
@@ -78,7 +75,7 @@ fn send_note_off(conn: &mut MidiOutputConnection, channel: u8, note: u8) -> Resu
     Ok(())
 }
 
-fn interactive_loop(mut conn: MidiOutputConnection, channel: u8) -> Result<()> {
+fn interactive_loop(conn: MidiOutputConnection, channel: u8) -> Result<()> {
     println!("Interactive MIDI controller");
     println!("Type `help` for commands. `exit` or Ctrl+C to quit.");
 
@@ -133,6 +130,14 @@ fn interactive_loop(mut conn: MidiOutputConnection, channel: u8) -> Result<()> {
                 let mut c = conn.lock().unwrap();
                 if let Err(e) = send_realtime(&mut *c, 0xFA) {
                     eprintln!("Failed to send Start: {:?}", e);
+                } else {
+                    // Send a few clock ticks to ensure devices that expect clock see it
+                    for _ in 0..6 {
+                        if let Err(e) = send_realtime(&mut *c, 0xF8) {
+                            eprintln!("Failed to send Clock tick: {:?}", e);
+                        }
+                        thread::sleep(Duration::from_millis(8));
+                    }
                 }
             }
             "stop" => {
@@ -210,7 +215,7 @@ fn interactive_loop(mut conn: MidiOutputConnection, channel: u8) -> Result<()> {
 mod gui {
     use super::*;
     use eframe::{egui, NativeOptions};
-    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::mpsc::{self, Sender};
 
     #[derive(Debug)]
     pub enum MidiCommand {
@@ -226,24 +231,24 @@ mod gui {
         Quit,
     }
 
-    pub fn run_gui(midi_out: MidiOutput, port_names: Vec<String>, initial_channel: u8) -> Result<()> {
+    pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: u8) -> Result<()> {
         let (tx, rx) = mpsc::channel::<MidiCommand>();
 
         // Background thread owns the MidiOutputConnection and performs sends.
         thread::spawn(move || {
             let mut conn: Option<MidiOutputConnection> = None;
-            let mut current_port: Option<usize> = None;
-            let mut current_channel: u8 = initial_channel;
+            let mut _current_port: Option<usize> = None;
+            let mut _current_channel: u8 = initial_channel;
 
             for cmd in rx {
                 match cmd {
                     MidiCommand::Connect(maybe_idx, ch) => {
-                        current_channel = ch;
+                        _current_channel = ch;
                         if let Some(idx) = maybe_idx {
                             match open_output(idx) {
                                 Ok(c) => {
                                     conn = Some(c);
-                                    current_port = Some(idx);
+                                    _current_port = Some(idx);
                                     eprintln!("Connected to port {}", idx);
                                 }
                                 Err(e) => eprintln!("Failed to connect: {:?}", e),
@@ -252,7 +257,7 @@ mod gui {
                     }
                     MidiCommand::Disconnect => {
                         conn = None;
-                        current_port = None;
+                        _current_port = None;
                         eprintln!("Disconnected");
                     }
                     MidiCommand::SendCC { channel, controller, value } => {
@@ -268,6 +273,13 @@ mod gui {
                         if let Some(ref mut c) = conn {
                             if let Err(e) = send_realtime(c, 0xFA) {
                                 eprintln!("Failed to send Start: {:?}", e);
+                            } else {
+                                for _ in 0..6 {
+                                    if let Err(e) = send_realtime(c, 0xF8) {
+                                        eprintln!("Failed to send Clock tick: {:?}", e);
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(8));
+                                }
                             }
                         }
                     }
@@ -441,10 +453,12 @@ mod gui {
             // Add a small close button in the bottom-right
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(), |ui| {
+                    // Align right-to-left; supply vertical Align argument (Center works well here).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Quit").clicked() {
                             let _ = self.tx.send(MidiCommand::Quit);
-                            frame.close();
+                            // close the native window by exiting the process.
+                            std::process::exit(0);
                         }
                     });
                 });
