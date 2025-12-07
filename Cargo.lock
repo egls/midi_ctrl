@@ -1738,6 +1738,7 @@ dependencies = [
  "anyhow",
  "clap",
  "eframe",
+ "egui",
  "midir",
  "winapi",
 ]

@@ -7,13 +7,6 @@ edition = "2024"
 midir = "0.8"
 anyhow = "1.0"
 clap = { version = "4.3", features = ["derive"] }
-
-# Optional GUI using egui / eframe
-eframe = { version = "0.24", optional = true }
-
-# Explicit winapi dependency so required platform modules are enabled on Windows
-winapi = { version = "0.3", optional = true, features = ["winuser", "windef", "wingdi", "winerror"] }
-
-[features]
-# enable with `cargo run --features egui`
-egui = ["eframe", "winapi"]
+eframe = "0.24"
+egui = "0.24"
+winapi = { version = "0.3", features = ["winuser", "windef", "wingdi", "winerror"] }

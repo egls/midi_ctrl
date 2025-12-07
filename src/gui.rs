@@ -1,22 +1,44 @@
-use crate::{send_cc, send_note_off, send_note_on, send_program_change, send_realtime, open_output, midi_map::MidiMap};
 use anyhow::Result;
 use eframe::{egui, NativeOptions};
 use midir::{MidiOutput, MidiOutputConnection};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use crate::midi_map::MidiMap;
 
 #[derive(Debug)]
 pub enum MidiCommand {
-    Connect(Option<usize>, u8), // port index, channel
+    Connect(Option<usize>, u8),
     Disconnect,
     SendCC { channel: u8, controller: u8, value: u8 },
     Start,
     Stop,
     Continue,
-    ProgramChange { channel: u8, program: u8 },
-    NoteOn { channel: u8, note: u8, vel: u8 },
-    NoteOff { channel: u8, note: u8 },
     Quit,
+}
+
+fn open_output(port_index: usize) -> Result<MidiOutputConnection> {
+    let midi_out = MidiOutput::new("midi_ctrl")?;
+    let ports = midi_out.ports();
+    let port = ports.get(port_index).ok_or_else(|| {
+        anyhow::anyhow!("No MIDI output port at index {}", port_index)
+    })?;
+    let port_name = midi_out
+        .port_name(port)
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let conn_out = midi_out
+        .connect(port, &format!("midi_ctrl-{}", port_name))?;
+    Ok(conn_out)
+}
+
+fn send_realtime(conn: &mut MidiOutputConnection, byte: u8) -> Result<()> {
+    conn.send(&[byte])?;
+    Ok(())
+}
+
+fn send_cc(conn: &mut MidiOutputConnection, channel: u8, controller: u8, value: u8) -> Result<()> {
+    let status = 0xB0 | ((channel - 1) & 0x0F);
+    conn.send(&[status, controller, value])?;
+    Ok(())
 }
 
 pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: u8) -> Result<()> {
@@ -90,27 +112,6 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
                         }
                     }
                 }
-                MidiCommand::ProgramChange { channel, program } => {
-                    if let Some(ref mut c) = conn {
-                        if let Err(e) = send_program_change(c, channel, program) {
-                            eprintln!("✗ Failed to send PC: {:?}", e);
-                        }
-                    }
-                }
-                MidiCommand::NoteOn { channel, note, vel } => {
-                    if let Some(ref mut c) = conn {
-                        if let Err(e) = send_note_on(c, channel, note, vel) {
-                            eprintln!("✗ Failed to send NoteOn: {:?}", e);
-                        }
-                    }
-                }
-                MidiCommand::NoteOff { channel, note } => {
-                    if let Some(ref mut c) = conn {
-                        if let Err(e) = send_note_off(c, channel, note) {
-                            eprintln!("✗ Failed to send NoteOff: {:?}", e);
-                        }
-                    }
-                }
                 MidiCommand::Quit => {
                     break;
                 }
@@ -118,7 +119,6 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
         }
     });
 
-    // Build and run the eframe app
     let app = MidiGuiApp::new(port_names, tx, initial_channel);
     let native_options = NativeOptions::default();
     eframe::run_native(
@@ -178,7 +178,6 @@ impl eframe::App for MidiGuiApp {
                             for (i, name) in self.port_names.iter().enumerate() {
                                 let label = format!("{} (#{})", name, i);
                                 if ui.selectable_value(&mut self.selected_port, Some(i), label).clicked() {
-                                    // selection changed
                                 }
                             }
                             if ui.selectable_value(&mut self.selected_port, None, "None").clicked() {
@@ -214,7 +213,6 @@ impl eframe::App for MidiGuiApp {
                     let _ = self.tx.send(MidiCommand::Continue);
                 }
 
-                // Show last sent CC info
                 if let Some((cc, val)) = self.last_sent_cc {
                     if let Some(time) = self.last_sent_time {
                         let elapsed = time.elapsed().as_secs_f32();
@@ -231,7 +229,6 @@ impl eframe::App for MidiGuiApp {
             ui.heading("Digitakt Parameters");
             ui.label("Move sliders to send CC values to your Digitakt");
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                // Group parameters by category
                 let mut categories: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
                 
                 for cc in 0..128u8 {
@@ -242,7 +239,6 @@ impl eframe::App for MidiGuiApp {
                     }
                 }
 
-                // Sort categories for consistent display
                 let mut sorted_categories: Vec<_> = categories.into_iter().collect();
                 sorted_categories.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -252,7 +248,6 @@ impl eframe::App for MidiGuiApp {
                     ui.group(|ui| {
                         ui.heading(&category);
                         
-                        // Display sliders in rows of 2 per category
                         let cols = 2;
                         for row in 0..((ccs.len() + cols - 1) / cols) {
                             ui.horizontal(|ui| {
@@ -296,7 +291,6 @@ impl eframe::App for MidiGuiApp {
             });
         });
 
-        // Add a small close button in the bottom-right
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
