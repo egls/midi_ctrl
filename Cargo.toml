@@ -1,0 +1,16 @@
+[package]
+name = "midi_ctrl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+midir = "0.8"
+anyhow = "1.0"
+clap = { version = "4.3", features = ["derive"] }
+
+# Optional GUI using egui / eframe
+eframe = { version = "0.24", optional = true }
+
+[features]
+# enable with `cargo run --features egui`
+egui = ["eframe"]
