@@ -37,34 +37,35 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
                             Ok(c) => {
                                 conn = Some(c);
                                 _current_port = Some(idx);
-                                eprintln!("Connected to port {}", idx);
+                                eprintln!("✓ Connected to port {}", idx);
                             }
-                            Err(e) => eprintln!("Failed to connect: {:?}", e),
+                            Err(e) => eprintln!("✗ Failed to connect: {:?}", e),
                         }
                     }
                 }
                 MidiCommand::Disconnect => {
                     conn = None;
                     _current_port = None;
-                    eprintln!("Disconnected");
+                    eprintln!("✓ Disconnected");
                 }
                 MidiCommand::SendCC { channel, controller, value } => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_cc(c, channel, controller, value) {
-                            eprintln!("Failed to send CC: {:?}", e);
+                            eprintln!("✗ Failed to send CC {}: {:?}", controller, e);
+                        } else {
+                            eprintln!("→ CC {} = {} (ch {})", controller, value, channel);
                         }
-                    } else {
-                        eprintln!("Not connected: cannot send CC");
                     }
                 }
                 MidiCommand::Start => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_realtime(c, 0xFA) {
-                            eprintln!("Failed to send Start: {:?}", e);
+                            eprintln!("✗ Failed to send Start: {:?}", e);
                         } else {
+                            eprintln!("► Start");
                             for _ in 0..6 {
                                 if let Err(e) = send_realtime(c, 0xF8) {
-                                    eprintln!("Failed to send Clock tick: {:?}", e);
+                                    eprintln!("✗ Failed to send Clock tick: {:?}", e);
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(8));
                             }
@@ -74,35 +75,39 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
                 MidiCommand::Stop => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_realtime(c, 0xFC) {
-                            eprintln!("Failed to send Stop: {:?}", e);
+                            eprintln!("✗ Failed to send Stop: {:?}", e);
+                        } else {
+                            eprintln!("⏹ Stop");
                         }
                     }
                 }
                 MidiCommand::Continue => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_realtime(c, 0xFB) {
-                            eprintln!("Failed to send Continue: {:?}", e);
+                            eprintln!("✗ Failed to send Continue: {:?}", e);
+                        } else {
+                            eprintln!("→ Continue");
                         }
                     }
                 }
                 MidiCommand::ProgramChange { channel, program } => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_program_change(c, channel, program) {
-                            eprintln!("Failed to send PC: {:?}", e);
+                            eprintln!("✗ Failed to send PC: {:?}", e);
                         }
                     }
                 }
                 MidiCommand::NoteOn { channel, note, vel } => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_note_on(c, channel, note, vel) {
-                            eprintln!("Failed to send NoteOn: {:?}", e);
+                            eprintln!("✗ Failed to send NoteOn: {:?}", e);
                         }
                     }
                 }
                 MidiCommand::NoteOff { channel, note } => {
                     if let Some(ref mut c) = conn {
                         if let Err(e) = send_note_off(c, channel, note) {
-                            eprintln!("Failed to send NoteOff: {:?}", e);
+                            eprintln!("✗ Failed to send NoteOff: {:?}", e);
                         }
                     }
                 }
@@ -130,8 +135,10 @@ struct MidiGuiApp {
     tx: Sender<MidiCommand>,
     selected_port: Option<usize>,
     channel: u8,
-    cc_values: Vec<u8>,
+    cc_values: Vec<i32>,  // Changed to i32 for direct slider compatibility
     connected: bool,
+    last_sent_cc: Option<(u8, u8)>,
+    last_sent_time: Option<std::time::Instant>,
 }
 
 impl MidiGuiApp {
@@ -141,8 +148,10 @@ impl MidiGuiApp {
             tx,
             selected_port: None,
             channel: initial_channel,
-            cc_values: vec![0u8; 128],
+            cc_values: vec![0i32; 128],  // Initialize as i32
             connected: false,
+            last_sent_cc: None,
+            last_sent_time: None,
         }
     }
 }
@@ -184,28 +193,42 @@ impl eframe::App for MidiGuiApp {
                         self.connected = true;
                     }
                 } else {
+                    ui.colored_label(egui::Color32::GREEN, "✓ Connected");
                     if ui.button("Disconnect").clicked() {
                         let _ = self.tx.send(MidiCommand::Disconnect);
                         self.connected = false;
                     }
                 }
 
-                if ui.button("Start").clicked() {
+                ui.separator();
+
+                if ui.button("▶ Start").clicked() {
                     let _ = self.tx.send(MidiCommand::Start);
                 }
-                if ui.button("Stop").clicked() {
+                if ui.button("⏹ Stop").clicked() {
                     let _ = self.tx.send(MidiCommand::Stop);
                 }
-                if ui.button("Continue").clicked() {
+                if ui.button("→ Continue").clicked() {
                     let _ = self.tx.send(MidiCommand::Continue);
+                }
+
+                // Show last sent CC info
+                if let Some((cc, val)) = self.last_sent_cc {
+                    if let Some(time) = self.last_sent_time {
+                        let elapsed = time.elapsed().as_secs_f32();
+                        if elapsed < 2.0 {
+                            ui.label(format!("Last: CC {} = {}", cc, val));
+                        }
+                    }
                 }
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Controllers (CC 0..127)");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Show sliders in rows of 4 to save vertical space
+            ui.heading("Controllers (CC 0..127)");
+            ui.label("Move sliders to send CC values to your Digitakt");
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                // Show sliders in rows of 4
                 let cols = 4;
                 for row in 0..((128 + cols - 1) / cols) {
                     ui.horizontal(|ui| {
@@ -214,23 +237,31 @@ impl eframe::App for MidiGuiApp {
                             if idx >= 128 {
                                 break;
                             }
-                            // slider text like "CC 0: 64"
-                            let mut v = self.cc_values[idx] as i32;
-                            if ui.vertical(|ui| {
+
+                            ui.vertical(|ui| {
                                 ui.label(format!("CC {}", idx));
-                                let slider = egui::Slider::new(&mut v, 0..=127).show_value(false);
-                                ui.add(slider)
-                            }).response.changed() {
-                                // changed
-                                let new_v = v as u8;
-                                self.cc_values[idx] = new_v;
-                                let _ = self.tx.send(MidiCommand::SendCC {
-                                    channel: self.channel,
-                                    controller: idx as u8,
-                                    value: new_v,
-                                });
-                            }
-                            // small spacer
+                                
+                                // Slider directly modifies self.cc_values[idx]
+                                let slider_response = ui.add(
+                                    egui::Slider::new(&mut self.cc_values[idx], 0..=127)
+                                        .show_value(true)
+                                );
+
+                                // Send CC when slider changes
+                                if slider_response.changed() {
+                                    let new_val = self.cc_values[idx] as u8;
+                                    let _ = self.tx.send(MidiCommand::SendCC {
+                                        channel: self.channel,
+                                        controller: idx as u8,
+                                        value: new_val,
+                                    });
+                                    self.last_sent_cc = Some((idx as u8, new_val));
+                                    self.last_sent_time = Some(std::time::Instant::now());
+                                }
+
+                                ui.label(format!("Value: {}", self.cc_values[idx]));
+                            });
+
                             ui.separator();
                         }
                     });
@@ -241,11 +272,9 @@ impl eframe::App for MidiGuiApp {
         // Add a small close button in the bottom-right
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Align right-to-left; supply vertical Align argument (Center works well here).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Quit").clicked() {
                         let _ = self.tx.send(MidiCommand::Quit);
-                        // close the native window by exiting the process.
                         std::process::exit(0);
                     }
                 });
