@@ -1,11 +1,11 @@
 use anyhow::Result;
 use eframe::{egui, NativeOptions};
 use midir::{MidiOutput, MidiOutputConnection};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use crate::midi_map::MidiMap;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum MidiCommand {
     Connect(Option<usize>, u8),
     Disconnect,
@@ -13,7 +13,15 @@ pub enum MidiCommand {
     Start,
     Stop,
     Continue,
+    QueryDevice,
+    SetBpm(f32),
     Quit,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceState {
+    Artist(String),
+    Bpm(f32),
 }
 
 fn open_output(port_index: usize) -> Result<MidiOutputConnection> {
@@ -41,14 +49,30 @@ fn send_cc(conn: &mut MidiOutputConnection, channel: u8, controller: u8, value: 
     Ok(())
 }
 
+fn send_timing_clock(conn: &mut MidiOutputConnection, bpm: f32, ticks: u32) -> Result<()> {
+    // Send timing clock pulses at the given BPM
+    // MIDI clock = 24 pulses per quarter note
+    // Time between pulses = 60 / (BPM * 24) seconds
+    let ms_per_tick = (60.0 / (bpm * 24.0)) * 1000.0;
+    
+    for _ in 0..ticks {
+        send_realtime(conn, 0xF8)?; // Clock (0xF8)
+        let duration = std::time::Duration::from_millis(ms_per_tick as u64);
+        thread::sleep(duration);
+    }
+    Ok(())
+}
+
 pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: u8) -> Result<()> {
     let (tx, rx) = mpsc::channel::<MidiCommand>();
+    let (state_tx, state_rx) = mpsc::channel::<DeviceState>();
 
     // Background thread owns the MidiOutputConnection and performs sends.
     thread::spawn(move || {
         let mut conn: Option<MidiOutputConnection> = None;
         let mut _current_port: Option<usize> = None;
         let mut _current_channel: u8 = initial_channel;
+        let mut current_bpm: f32 = 120.0;
 
         for cmd in rx {
             match cmd {
@@ -60,6 +84,9 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
                                 conn = Some(c);
                                 _current_port = Some(idx);
                                 eprintln!("✓ Connected to port {}", idx);
+                                // Broadcast device state on connect
+                                let _ = state_tx.send(DeviceState::Artist("Digitakt".to_string()));
+                                let _ = state_tx.send(DeviceState::Bpm(current_bpm));
                             }
                             Err(e) => eprintln!("✗ Failed to connect: {:?}", e),
                         }
@@ -112,6 +139,16 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
                         }
                     }
                 }
+                MidiCommand::QueryDevice => {
+                    // Broadcast current device state
+                    let _ = state_tx.send(DeviceState::Artist("Digitakt".to_string()));
+                    let _ = state_tx.send(DeviceState::Bpm(current_bpm));
+                }
+                MidiCommand::SetBpm(bpm) => {
+                    current_bpm = bpm;
+                    eprintln!("⏱ BPM set to {}", bpm);
+                    let _ = state_tx.send(DeviceState::Bpm(bpm));
+                }
                 MidiCommand::Quit => {
                     break;
                 }
@@ -119,7 +156,7 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
         }
     });
 
-    let app = MidiGuiApp::new(port_names, tx, initial_channel);
+    let app = MidiGuiApp::new(port_names, tx, state_rx, initial_channel);
     let native_options = NativeOptions::default();
     eframe::run_native(
         "midi_ctrl - Digitakt MIDI controller",
@@ -133,6 +170,7 @@ pub fn run_gui(_midi_out: MidiOutput, port_names: Vec<String>, initial_channel: 
 struct MidiGuiApp {
     port_names: Vec<String>,
     tx: Sender<MidiCommand>,
+    state_rx: Receiver<DeviceState>,
     selected_port: Option<usize>,
     channel: u8,
     cc_values: Vec<i32>,
@@ -140,13 +178,16 @@ struct MidiGuiApp {
     last_sent_cc: Option<(u8, u8)>,
     last_sent_time: Option<std::time::Instant>,
     midi_map: MidiMap,
+    device_artist: String,
+    device_bpm: f32,
 }
 
 impl MidiGuiApp {
-    fn new(port_names: Vec<String>, tx: Sender<MidiCommand>, initial_channel: u8) -> Self {
+    fn new(port_names: Vec<String>, tx: Sender<MidiCommand>, state_rx: Receiver<DeviceState>, initial_channel: u8) -> Self {
         Self {
             port_names,
             tx,
+            state_rx,
             selected_port: None,
             channel: initial_channel,
             cc_values: vec![0i32; 128],
@@ -154,12 +195,31 @@ impl MidiGuiApp {
             last_sent_cc: None,
             last_sent_time: None,
             midi_map: MidiMap::new(),
+            device_artist: "Unknown".to_string(),
+            device_bpm: 120.0,
+        }
+    }
+
+    fn update_device_state(&mut self) {
+        // Drain all pending device state updates
+        while let Ok(state) = self.state_rx.try_recv() {
+            match state {
+                DeviceState::Artist(artist) => {
+                    self.device_artist = artist;
+                }
+                DeviceState::Bpm(bpm) => {
+                    self.device_bpm = bpm;
+                }
+            }
         }
     }
 }
 
 impl eframe::App for MidiGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update device state from background thread
+        self.update_device_state();
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("MIDI Port:");
@@ -199,6 +259,17 @@ impl eframe::App for MidiGuiApp {
                         let _ = self.tx.send(MidiCommand::Disconnect);
                         self.connected = false;
                     }
+                    
+                    // Show device info
+                    ui.separator();
+                    ui.label(format!("Artist: {}", self.device_artist));
+                    
+                    // BPM control
+                    ui.label("BPM:");
+                    let mut bpm_value = self.device_bpm;
+                    if ui.add(egui::Slider::new(&mut bpm_value, 20.0..=300.0).show_value(true)).changed() {
+                        let _ = self.tx.send(MidiCommand::SetBpm(bpm_value));
+                    }
                 }
 
                 ui.separator();
@@ -225,7 +296,7 @@ impl eframe::App for MidiGuiApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+               egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Digitakt Parameters");
             ui.label("Move sliders to send CC values to your Digitakt");
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -242,52 +313,109 @@ impl eframe::App for MidiGuiApp {
                 let mut sorted_categories: Vec<_> = categories.into_iter().collect();
                 sorted_categories.sort_by(|a, b| a.0.cmp(&b.0));
 
-                for (category, mut ccs) in sorted_categories {
-                    ccs.sort();
-                    
-                    ui.group(|ui| {
-                        ui.heading(&category);
-                        
-                        let cols = 2;
-                        for row in 0..((ccs.len() + cols - 1) / cols) {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let idx = row * cols + col;
-                                    if idx >= ccs.len() {
-                                        break;
-                                    }
-                                    
-                                    let cc = ccs[idx];
-                                    let param_name = self.midi_map.get_name(cc);
-                                    
-                                    ui.vertical(|ui| {
-                                        ui.label(&param_name);
-                                        
-                                        let slider_response = ui.add(
-                                            egui::Slider::new(&mut self.cc_values[cc as usize], 0..=127)
-                                                .show_value(true)
-                                        );
-                                        
-                                        if slider_response.changed() {
-                                            let new_val = self.cc_values[cc as usize] as u8;
-                                            let _ = self.tx.send(MidiCommand::SendCC {
-                                                channel: self.channel,
-                                                controller: cc,
-                                                value: new_val,
+                ui.horizontal(|ui| {
+                    // Left column
+                    ui.vertical(|ui| {
+                        let half = (sorted_categories.len() + 1) / 2;
+                        for (category, mut ccs) in sorted_categories.iter().take(half).cloned() {
+                            ccs.sort();
+                            
+                            ui.group(|ui| {
+                                ui.heading(&category);
+                                
+                                let cols = 2;
+                                for row in 0..((ccs.len() + cols - 1) / cols) {
+                                    ui.horizontal(|ui| {
+                                        for col in 0..cols {
+                                            let idx = row * cols + col;
+                                            if idx >= ccs.len() {
+                                                break;
+                                            }
+                                            
+                                            let cc = ccs[idx];
+                                            let param_name = self.midi_map.get_name(cc);
+                                            
+                                            ui.vertical(|ui| {
+                                                ui.label(&param_name);
+                                                
+                                                let slider_response = ui.add(
+                                                    egui::Slider::new(&mut self.cc_values[cc as usize], 0..=127)
+                                                        .show_value(true)
+                                                );
+                                                
+                                                if slider_response.changed() {
+                                                    let new_val = self.cc_values[cc as usize] as u8;
+                                                    let _ = self.tx.send(MidiCommand::SendCC {
+                                                        channel: self.channel,
+                                                        controller: cc,
+                                                        value: new_val,
+                                                    });
+                                                    self.last_sent_cc = Some((cc, new_val));
+                                                    self.last_sent_time = Some(std::time::Instant::now());
+                                                }
+                                                
+                                                ui.label(format!("Value: {}", self.cc_values[cc as usize]));
                                             });
-                                            self.last_sent_cc = Some((cc, new_val));
-                                            self.last_sent_time = Some(std::time::Instant::now());
+                                            
+                                            ui.separator();
                                         }
-                                        
-                                        ui.label(format!("Value: {}", self.cc_values[cc as usize]));
                                     });
-                                    
-                                    ui.separator();
                                 }
                             });
                         }
                     });
-                }
+
+                    // Right column
+                    ui.vertical(|ui| {
+                        let half = (sorted_categories.len() + 1) / 2;
+                        for (category, mut ccs) in sorted_categories.iter().skip(half).cloned() {
+                            ccs.sort();
+                            
+                            ui.group(|ui| {
+                                ui.heading(&category);
+                                
+                                let cols = 2;
+                                for row in 0..((ccs.len() + cols - 1) / cols) {
+                                    ui.horizontal(|ui| {
+                                        for col in 0..cols {
+                                            let idx = row * cols + col;
+                                            if idx >= ccs.len() {
+                                                break;
+                                            }
+                                            
+                                            let cc = ccs[idx];
+                                            let param_name = self.midi_map.get_name(cc);
+                                            
+                                            ui.vertical(|ui| {
+                                                ui.label(&param_name);
+                                                
+                                                let slider_response = ui.add(
+                                                    egui::Slider::new(&mut self.cc_values[cc as usize], 0..=127)
+                                                        .show_value(true)
+                                                );
+                                                
+                                                if slider_response.changed() {
+                                                    let new_val = self.cc_values[cc as usize] as u8;
+                                                    let _ = self.tx.send(MidiCommand::SendCC {
+                                                        channel: self.channel,
+                                                        controller: cc,
+                                                        value: new_val,
+                                                    });
+                                                    self.last_sent_cc = Some((cc, new_val));
+                                                    self.last_sent_time = Some(std::time::Instant::now());
+                                                }
+                                                
+                                                ui.label(format!("Value: {}", self.cc_values[cc as usize]));
+                                            });
+                                            
+                                            ui.separator();
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
             });
         });
 
